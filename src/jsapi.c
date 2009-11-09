@@ -1851,14 +1851,8 @@ JS_NewDoubleValue(JSContext *cx, jsdouble d, jsval *rval)
 JS_PUBLIC_API(JSBool)
 JS_NewNumberValue(JSContext *cx, jsdouble d, jsval *rval)
 {
-    jsint i;
-
     CHECK_REQUEST(cx);
-    if (JSDOUBLE_IS_INT(d, i) && INT_FITS_IN_JSVAL(i)) {
-        *rval = INT_TO_JSVAL(i);
-        return JS_TRUE;
-    }
-    return JS_NewDoubleValue(cx, d, rval);
+    return js_NewWeaklyRootedNumber(cx, d, rval);
 }
 
 #undef JS_AddRoot
@@ -4351,8 +4345,10 @@ js_generic_fast_native_method_dispatcher(JSContext *cx, uintN argc, jsval *vp)
      * it as if the static was called with one parameter, the explicit |this|
      * object.
      */
-    if (argc != 0)
-        --argc;
+    if (argc != 0) {
+        /* Clear the last parameter in case too few arguments were passed. */
+        vp[2 + --argc] = JSVAL_VOID;
+    }
 
     return ((JSFastNative) fs->call)(cx, argc, vp);
 }
@@ -4409,8 +4405,10 @@ js_generic_native_method_dispatcher(JSContext *cx, JSObject *obj,
      * it as if the static was called with one parameter, the explicit |this|
      * object.
      */
-    if (argc != 0)
-        --argc;
+    if (argc != 0) {
+        /* Clear the last parameter in case too few arguments were passed. */
+        argv[--argc] = JSVAL_VOID;
+    }
 
     return fs->call(cx, JSVAL_TO_OBJECT(argv[-1]), argc, argv, rval);
 }
@@ -5621,6 +5619,10 @@ JS_ClearRegExpStatics(JSContext *cx)
     res->parenCount = 0;
     res->lastMatch = res->lastParen = js_EmptySubString;
     res->leftContext = res->rightContext = js_EmptySubString;
+    if (res->moreParens) {
+        JS_free(cx, res->moreParens);
+        res->moreParens = NULL;
+    }
     cx->runtime->gcPoke = JS_TRUE;
 }
 
@@ -5790,21 +5792,62 @@ JS_PUBLIC_API(jsword)
 JS_SetContextThread(JSContext *cx)
 {
 #ifdef JS_THREADSAFE
-    jsword old = JS_THREAD_ID(cx);
-    if (!js_SetContextThread(cx))
+    JSRuntime *rt;
+    JSThread *thread;
+    
+    JS_ASSERT(cx->requestDepth == 0);
+    if (cx->thread) {
+        JS_ASSERT(cx->thread->id == js_CurrentThreadId());
+        return cx->thread->id;
+    }
+
+    rt = cx->runtime;
+    thread = js_GetCurrentThread(rt);
+    if (!thread) {
+        js_ReportOutOfMemory(cx);
         return -1;
-    return old;
-#else
-    return 0;
+    }
+
+    /*
+     * We must not race with a GC that accesses cx->thread for all threads,
+     * see bug 476934.
+     */
+    JS_LOCK_GC(rt);
+    js_WaitForGC(rt);
+    js_InitContextThread(cx, thread);
+    JS_UNLOCK_GC(rt);
 #endif
+    return 0;
 }
 
 JS_PUBLIC_API(jsword)
 JS_ClearContextThread(JSContext *cx)
 {
 #ifdef JS_THREADSAFE
-    jsword old = JS_THREAD_ID(cx);
-    js_ClearContextThread(cx);
+    jsword old;
+    JSRuntime *rt;
+    
+    /*
+     * This must be called outside a request and, if cx is associated with a
+     * thread, this must be called only from that thread.  If not, this is a
+     * harmless no-op.
+     */
+    JS_ASSERT(cx->requestDepth == 0);
+    if (!cx->thread)
+        return 0;
+    old = cx->thread->id;
+    JS_ASSERT(old == js_CurrentThreadId());
+
+    /*
+     * We must not race with a GC that accesses cx->thread for all threads,
+     * see bug 476934.
+     */
+    rt = cx->runtime;
+    JS_LOCK_GC(rt);
+    js_WaitForGC(rt);
+    JS_REMOVE_AND_INIT_LINK(&cx->threadLinks);
+    cx->thread = NULL;
+    JS_UNLOCK_GC(cx->runtime);
     return old;
 #else
     return 0;
